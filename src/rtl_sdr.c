@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <fcntl.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -60,6 +61,7 @@ void usage(void)
 		"\t[-F output format, CU8|CS8|CS16|CF32 (default: CU8)]\n"
 		"\t[-S force sync output (default: async)]\n"
 		"\t[-D direct_sampling_mode, 0 (default/off), 1 (I), 2 (Q), 3 (no-mod)]\n"
+		"\t[-c allow control from stdin while streaming]\n"
 		"\tfilename (a '-' dumps samples to stdout)\n\n");
 	exit(1);
 }
@@ -83,6 +85,84 @@ static void sighandler(int signum)
 }
 #endif
 
+int stdin_control_mode = 0;
+#define STDIN_CONTROL_BUFFER_SIZE 1024
+char stdin_control_buffer[STDIN_CONTROL_BUFFER_SIZE];
+int stdin_control_buffer_index = 0;
+
+void stdin_control_init()
+{
+    fprintf(stderr,"rx_sdr stdin control mode on\n");
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    stdin_control_mode = 1;
+}
+
+void stdin_control_parse(char* str)
+{
+    char* param_name;
+    char* param_value;
+    param_name = str;
+    int i;
+    for(i=0;str[i];i++)
+    {
+        if(str[i]=='=') 
+        {
+            str[i]='\0';
+            param_value = str+i+1;
+            break;
+        }
+    }
+    if(!strcmp("f", param_name))
+    {
+        unsigned param_value_uint = strtoul(param_value, NULL, 10);
+	    verbose_set_frequency(dev, param_value_uint);
+    }
+    else if(!strcmp("s", param_name))
+    {
+        unsigned param_value_uint = strtoul(param_value, NULL, 10);
+        verbose_set_sample_rate(dev, param_value_uint);
+    }
+    else if(!strcmp("g", param_name))
+    {
+        if(!strcmp("auto", param_value) || !param_value) verbose_auto_gain(dev);
+        else verbose_gain_str_set(dev, param_value);
+    }
+    else if(!strcmp("p", param_name))
+    {
+        int param_value_int = atoi(param_value);
+        verbose_ppm_set(dev, param_value_int);
+    }
+    else if(!strcmp("D", param_name))
+    {
+        int param_value_int = atoi(param_value);
+        verbose_direct_sampling(dev, param_value_int);
+    }
+    else 
+    {
+        fprintf(stderr,"rx_sdr: invalid stdin control string\n");
+    }
+}
+
+void stdin_control_apply()
+{
+    int ret=0;
+    char stdin_char;
+    ret = read(STDIN_FILENO,&stdin_char,1);
+    while(ret>0) 
+    {
+        if(stdin_char == '\n')
+        {
+            stdin_control_buffer[stdin_control_buffer_index]='\0';
+            stdin_control_parse(stdin_control_buffer);
+            stdin_control_buffer_index = 0;
+        }
+        else stdin_control_buffer[stdin_control_buffer_index++]=stdin_char;
+        if(stdin_control_buffer_index>=STDIN_CONTROL_BUFFER_SIZE-1) stdin_control_buffer_index = 0;
+        ret = read(STDIN_FILENO,&stdin_char,1);
+    }
+}
+
 int main(int argc, char **argv)
 {
 #ifndef _WIN32
@@ -105,7 +185,7 @@ int main(int argc, char **argv)
 	uint32_t out_block_size = DEFAULT_BUF_LENGTH;
 	char *output_format = SOAPY_SDR_CU8;
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:n:p:D:SF:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:n:p:D:SF:c")) != -1) {
 		switch (opt) {
 		case 'd':
 			dev_query = optarg;
@@ -150,6 +230,9 @@ int main(int argc, char **argv)
 		case 'D':
 			direct_sampling = atoi(optarg);
 			break;
+		case 'c':
+			stdin_control_mode = 1;
+			break;
 		default:
 			usage();
 			break;
@@ -185,7 +268,7 @@ int main(int argc, char **argv)
 	r = verbose_device_search(dev_query, &dev, &stream, SOAPY_SDR_CS16);
 
 	if (r != 0) {
-		fprintf(stderr, "Failed to open rtlsdr device matching %s.\n", dev_query);
+		fprintf(stderr, "Failed to open SDR device matching query string: %s.\n", dev_query);
 		exit(1);
 	}
 
@@ -202,6 +285,8 @@ int main(int argc, char **argv)
 #else
 	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
 #endif
+
+    if(stdin_control_mode) stdin_control_init();
 
 	if (direct_sampling) {
 		verbose_direct_sampling(dev, direct_sampling);
@@ -319,7 +404,8 @@ int main(int argc, char **argv)
 
 			if (samples_to_read > 0)
 				samples_to_read -= n_read;
-		}
+            if(stdin_control_mode) stdin_control_apply();
+        }
 	}
 
 	if (do_exit)
